@@ -6,7 +6,7 @@ ingestion, guaranteeing strict parity with PostgreSQL database schema and ENUMs.
 """
 
 from enum import Enum
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 
 class RaceCategory(str, Enum):
@@ -30,9 +30,9 @@ class ParticipantRowSchema(BaseModel):
         registration_fee: Currency amount paid for the race entry.
     """
 
-    first_name: str
-    last_name: str
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
     email: EmailStr
-    bib_number: str
+    bib_number: str = Field(..., min_length=1, max_length=50)
     category: RaceCategory
-    registration_fee: float
+    registration_fee: float = Field(..., ge=0.0)
