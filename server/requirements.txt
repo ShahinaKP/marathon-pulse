@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+azure-storage-blob
+azure-servicebus
+psycopg2-binary
+pydantic
+python-dotenv
+pytest
+httpx
+pytest-asyncio
