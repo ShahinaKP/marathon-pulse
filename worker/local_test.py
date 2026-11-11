@@ -9,7 +9,6 @@ invoking the streaming processor, and asserting database state.
 import io
 import os
 import uuid
-import psycopg2
 from consumer import get_db_connection, process_excel_stream
 
 

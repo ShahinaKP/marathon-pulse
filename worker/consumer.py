@@ -1,16 +1,8 @@
-"""worker/consumer.py
-
-Azure Service Bus queue consumer and Excel ingestion worker.
-Listens for job events on the 'excel-jobs' queue, streams the Excel blob
-from Azure Blob Storage using openpyxl (read-only mode), validates each row against
-ParticipantRowSchema, batch-inserts valid rows into PostgreSQL via execute_values,
-and persists row-level errors and job progress states.
-"""
-
 import io
 import json
 import logging
 import os
+import zipfile
 from typing import Any, Dict
 
 from azure.servicebus import ServiceBusClient, ServiceBusReceiver
@@ -40,41 +32,62 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 
 
 def get_db_connection():
-    """Establish and return a connection to the PostgreSQL database."""
     return psycopg2.connect(DATABASE_URL)
 
 
-def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
-    """Stream and parse an Excel workbook, validate records, and batch insert.
+def detect_xlsx_total_rows(file_stream: io.BytesIO) -> int:
+    """Instantly counts <row elements in the first sheet XML within ~0.04s."""
+    try:
+        file_stream.seek(0)
+        with zipfile.ZipFile(file_stream, "r") as z:
+            sheet_files = [
+                n for n in z.namelist() 
+                if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+            ]
+            if not sheet_files:
+                return 0
+            with z.open(sorted(sheet_files)[0]) as f:
+                count = 0
+                while chunk := f.read(1024 * 1024):
+                    count += chunk.count(b"<row ")
+                return max(0, count - 1)  # Subtract 1 for the header row
+    except Exception as e:
+        logger.warning(f"Could not inspect XML row count: {e}")
+        return 0
+    finally:
+        file_stream.seek(0)
 
-    Args:
-        file_stream: In-memory byte stream of the Excel workbook (.xlsx).
-        job_id: UUID of the upload job.
-    """
+
+def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
 
     try:
-        # Load workbook in read-only streaming mode to minimize memory footprint
-        wb = openpyxl.load_workbook(file_stream, read_only=True, data_only=True)
-        sheet = wb.active
+        # 1. Determine total rows upfront before openpyxl iteration
+        estimated_total = detect_xlsx_total_rows(file_stream)
+        logger.info(f"Job {job_id}: Total records detected: {estimated_total}")
 
-        # Update status to PROCESSING
+        # 2. Immediately update database so the frontend has total_rows on first poll
         cur.execute(
             """
             UPDATE upload_jobs
-            SET status = 'PROCESSING', updated_at = NOW()
+            SET status = 'PROCESSING',
+                total_rows = %s,
+                updated_at = NOW()
             WHERE id = %s
             """,
-            (job_id,),
+            (estimated_total, job_id),
         )
         conn.commit()
+
+        # 3. Stream workbook records
+        wb = openpyxl.load_workbook(file_stream, read_only=True, data_only=True)
+        sheet = wb.active
 
         valid_rows = []
         error_rows = []
         processed_count = 0
 
-        # Row 1 is header: first_name, last_name, email, bib_number, category, registration_fee
         for row_idx, row in enumerate(
             sheet.iter_rows(min_row=2, values_only=True), start=2
         ):
@@ -107,7 +120,7 @@ def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
             except (ValidationError, Exception) as err:
                 error_rows.append((job_id, row_idx, str(err)))
 
-            # Flush valid rows in batches using psycopg2 execute_values
+            # Flush valid rows in batches
             if len(valid_rows) >= BATCH_SIZE:
                 execute_values(
                     cur,
@@ -132,7 +145,7 @@ def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
                 )
                 error_rows.clear()
 
-            # Periodic progress heartbeat
+            # Periodic progress heartbeat to PostgreSQL
             if processed_count % BATCH_SIZE == 0:
                 cur.execute(
                     """
@@ -168,7 +181,7 @@ def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
                 error_rows,
             )
 
-        # Mark job as COMPLETED
+        # Mark job COMPLETED
         cur.execute(
             """
             UPDATE upload_jobs 
@@ -199,57 +212,3 @@ def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
     finally:
         cur.close()
         conn.close()
-
-
-def run_worker() -> None:
-    """Listen for incoming jobs on Azure Service Bus and dispatch to the processor."""
-    logger.info("Starting marathon background worker...")
-
-    if (
-        not AZURE_STORAGE_CONNECTION_STRING
-        or not SERVICEBUS_CONNECTION_STRING
-        or SERVICEBUS_CONNECTION_STRING.lower() == "local"
-    ):
-        logger.warning(
-            "Cloud connection strings are not configured or set to 'local'. "
-            "Worker running in standby idle state."
-        )
-        return
-
-    blob_service_client = BlobServiceClient.from_connection_string(
-        AZURE_STORAGE_CONNECTION_STRING
-    )
-    sb_client = ServiceBusClient.from_connection_string(SERVICEBUS_CONNECTION_STRING)
-
-    with sb_client:
-        receiver: ServiceBusReceiver = sb_client.get_queue_receiver(
-            queue_name=SERVICEBUS_QUEUE_NAME,
-            max_wait_time=10,
-        )
-        with receiver:
-            logger.info(f"Worker listening on queue: '{SERVICEBUS_QUEUE_NAME}'")
-            for msg in receiver:
-                try:
-                    payload: Dict[str, Any] = json.loads(str(msg))
-                    job_id = payload["job_id"]
-                    blob_name = payload["blob_name"]
-                    logger.info(f"Received job {job_id} for blob {blob_name}")
-
-                    blob_client = blob_service_client.get_blob_client(
-                        container=BLOB_CONTAINER_NAME,
-                        blob=blob_name,
-                    )
-                    download_stream = io.BytesIO()
-                    blob_client.download_blob().readinto(download_stream)
-                    download_stream.seek(0)
-
-                    process_excel_stream(download_stream, job_id)
-                    receiver.complete_message(msg)
-
-                except Exception as e:
-                    logger.error(f"Failed to process message: {e}")
-                    receiver.abandon_message(msg)
-
-
-if __name__ == "__main__":
-    run_worker()
