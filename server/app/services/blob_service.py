@@ -1,59 +1,34 @@
 """server/app/services/blob_service.py
 
-Azure Blob Storage integration service.
-Handles initialization, container provisioning, and chunked streaming of
-binary file payloads (such as FastAPI's SpooledTemporaryFile) directly to
-Azure Blob Storage without loading the full file into system RAM.
+Azure Blob Storage integration. Streams the uploaded file to a blob without
+loading it into RAM. There is deliberately NO local fallback: if storage is
+not configured or unreachable the upload fails loudly instead of returning a
+success for a file that was never stored.
 """
 
+from functools import lru_cache
 from typing import BinaryIO
+
 from azure.storage.blob import BlobServiceClient
+
 from app.config import settings
 
 
+@lru_cache(maxsize=1)
+def _container_client():
+    """Create (once per process) the container client and ensure the container exists."""
+    if not settings.AZURE_STORAGE_CONNECTION_STRING:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not set.")
+    service = BlobServiceClient.from_connection_string(settings.AZURE_STORAGE_CONNECTION_STRING)
+    container = service.get_container_client(settings.BLOB_CONTAINER_NAME)
+    if not container.exists():
+        container.create_container()
+    return container
+
+
 class BlobService:
-    """Service wrapper for Azure Storage Blob SDK operations."""
+    """Thin wrapper over the Azure Blob SDK (synchronous - call from a worker thread)."""
 
-    def __init__(self):
-        """Initialize Azure Blob Storage client and verify target container.
-
-        Reads connection credentials from application settings. If credentials
-        are absent or fail during initialization, self.client remains None,
-        falling back to local mock references.
-        """
-        self.conn_str = settings.AZURE_STORAGE_CONNECTION_STRING
-        self.container_name = settings.BLOB_CONTAINER_NAME
-        self.client = None
-
-        if self.conn_str:
-            try:
-                self.client = BlobServiceClient.from_connection_string(self.conn_str)
-                container_client = self.client.get_container_client(self.container_name)
-                if not container_client.exists():
-                    container_client.create_container()
-            except Exception:
-                # Silently catch initialization errors (e.g., offline credentials,
-                # network timeouts) to allow local fallback execution.
-                pass
-
-    def upload_stream(self, blob_name: str, stream: BinaryIO) -> str:
-        """Stream an open binary file directly to Azure Blob Storage.
-
-        Args:
-            blob_name: Target path/filename in the destination container.
-            stream: Readable binary stream (e.g., file-like object, SpooledTemporaryFile).
-
-        Returns:
-            str: Public or internal HTTPS URL of the uploaded blob if client
-                 is connected, otherwise a pseudo URI formatted as
-                 `local://{container_name}/{blob_name}`.
-        """
-        if self.client:
-            blob_client = self.client.get_blob_client(
-                container=self.container_name, 
-                blob=blob_name
-            )
-            blob_client.upload_blob(stream, overwrite=True)
-            return blob_client.url
-
-        return f"local://{self.container_name}/{blob_name}"
+    def upload_stream(self, blob_name: str, stream: BinaryIO) -> None:
+        """Upload an open binary stream to `blob_name`. Raises on any failure."""
+        _container_client().upload_blob(name=blob_name, data=stream, overwrite=True)

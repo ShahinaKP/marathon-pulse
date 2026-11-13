@@ -1,214 +1,148 @@
-import io
+"""worker/consumer.py
+
+Entry point of the cloud worker (the container's CMD).
+
+Polls the Azure Storage Queue, claims one job at a time, processes it, and
+decides what to do with the message:
+
+  success                -> delete the message
+  already done / unknown -> delete the message
+  another worker busy    -> hide the message for a while, do not count an attempt
+  transient failure      -> hide the message with a growing delay (retry)
+  permanent / last try   -> job is FAILED, delete the message
+
+The process never exits on its own when the queue is empty. KEDA scales the
+replica count (down to zero) from the queue length; on scale-in the platform
+sends SIGTERM, which this loop honours between jobs.
+"""
+
 import json
 import logging
-import os
-import zipfile
-from typing import Any, Dict
+import signal
+import threading
+import uuid
 
-from azure.servicebus import ServiceBusClient, ServiceBusReceiver
-from azure.storage.blob import BlobServiceClient
-import openpyxl
-import psycopg2
-from psycopg2.extras import execute_values
-from pydantic import ValidationError
+from azure.storage.queue import QueueClient
 
-from schemas import ParticipantRowSchema
+import processor
+from settings import settings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("worker")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("worker.consumer")
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/marathon_pulse",
-)
-AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-SERVICEBUS_CONNECTION_STRING = os.getenv("SERVICEBUS_CONNECTION_STRING", "local")
-BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME", "excel-uploads")
-SERVICEBUS_QUEUE_NAME = os.getenv("SERVICEBUS_QUEUE_NAME", "excel-jobs")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
+shutdown = threading.Event()
 
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+def _request_shutdown(signum, _frame) -> None:
+    logger.info("Signal %s received - finishing the current job, then stopping.", signum)
+    shutdown.set()
 
 
-def detect_xlsx_total_rows(file_stream: io.BytesIO) -> int:
-    """Instantly counts <row elements in the first sheet XML within ~0.04s."""
+def _safe_delete(queue: QueueClient, msg) -> None:
+    """Delete a message; a stale receipt (message already redelivered) is not fatal."""
     try:
-        file_stream.seek(0)
-        with zipfile.ZipFile(file_stream, "r") as z:
-            sheet_files = [
-                n for n in z.namelist() 
-                if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
-            ]
-            if not sheet_files:
-                return 0
-            with z.open(sorted(sheet_files)[0]) as f:
-                count = 0
-                while chunk := f.read(1024 * 1024):
-                    count += chunk.count(b"<row ")
-                return max(0, count - 1)  # Subtract 1 for the header row
-    except Exception as e:
-        logger.warning(f"Could not inspect XML row count: {e}")
-        return 0
-    finally:
-        file_stream.seek(0)
+        queue.delete_message(msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not delete message %s: %s", msg.id, exc)
 
 
-def process_excel_stream(file_stream: io.BytesIO, job_id: str) -> None:
-    conn = get_db_connection()
-    cur = conn.cursor()
-
+def _safe_hide(queue: QueueClient, msg, seconds: int) -> None:
     try:
-        # 1. Determine total rows upfront before openpyxl iteration
-        estimated_total = detect_xlsx_total_rows(file_stream)
-        logger.info(f"Job {job_id}: Total records detected: {estimated_total}")
+        queue.update_message(msg, visibility_timeout=seconds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not reschedule message %s: %s", msg.id, exc)
 
-        # 2. Immediately update database so the frontend has total_rows on first poll
-        cur.execute(
-            """
-            UPDATE upload_jobs
-            SET status = 'PROCESSING',
-                total_rows = %s,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (estimated_total, job_id),
-        )
-        conn.commit()
 
-        # 3. Stream workbook records
-        wb = openpyxl.load_workbook(file_stream, read_only=True, data_only=True)
-        sheet = wb.active
+def handle_message(queue: QueueClient, msg) -> None:
+    # --- parse -----------------------------------------------------------
+    try:
+        job_id = json.loads(msg.content)["job_id"]
+        uuid.UUID(job_id)
+    except Exception:  # noqa: BLE001 - anything unparseable is unprocessable
+        logger.error("Dropping malformed message %s: %r", msg.id, msg.content)
+        _safe_delete(queue, msg)
+        return
 
-        valid_rows = []
-        error_rows = []
-        processed_count = 0
+    # --- poison-message backstop ----------------------------------------
+    if msg.dequeue_count > settings.MAX_DEQUEUE_COUNT:
+        logger.error("Job %s delivered %d times - failing it.", job_id, msg.dequeue_count)
+        processor.mark_retry_or_fail(job_id, "Message delivered too many times.", permanent=True)
+        _safe_delete(queue, msg)
+        return
 
-        for row_idx, row in enumerate(
-            sheet.iter_rows(min_row=2, values_only=True), start=2
-        ):
-            if not row or not any(row):
-                continue
+    # --- claim -------------------------------------------------------------
+    outcome, blob_name = processor.claim_job(job_id)
+    if outcome == processor.BUSY:
+        logger.info("Job %s is being processed elsewhere - rechecking later.", job_id)
+        _safe_hide(queue, msg, settings.BUSY_REQUEUE_SECONDS)
+        return
+    if outcome != processor.CLAIMED:
+        logger.info("Job %s not claimable (%s) - dropping message.", job_id, outcome)
+        _safe_delete(queue, msg)
+        return
 
-            processed_count += 1
-            raw_data = {
-                "first_name": row[0],
-                "last_name": row[1],
-                "email": row[2],
-                "bib_number": str(row[3]) if row[3] is not None else None,
-                "category": str(row[4]).strip().upper() if row[4] else None,
-                "registration_fee": row[5],
-            }
+    # --- process -----------------------------------------------------------
+    logger.info("Job %s claimed (blob %s)", job_id, blob_name)
+    try:
+        processor.process_job(job_id, blob_name)
+    except processor.PermanentJobError as exc:
+        logger.error("Job %s failed permanently: %s", job_id, exc)
+        _finish_failed_attempt(queue, msg, job_id, str(exc), permanent=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Job %s attempt failed", job_id)
+        _finish_failed_attempt(queue, msg, job_id, f"{type(exc).__name__}: {exc}", permanent=False)
+    else:
+        _safe_delete(queue, msg)
 
-            try:
-                validated = ParticipantRowSchema(**raw_data)
-                valid_rows.append(
-                    (
-                        validated.first_name,
-                        validated.last_name,
-                        validated.email,
-                        validated.bib_number,
-                        validated.category.value,
-                        validated.registration_fee,
-                        job_id,
-                    )
-                )
-            except (ValidationError, Exception) as err:
-                error_rows.append((job_id, row_idx, str(err)))
 
-            # Flush valid rows in batches
-            if len(valid_rows) >= BATCH_SIZE:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO marathon_participants 
-                        (first_name, last_name, email, bib_number, category, registration_fee, job_id)
-                    VALUES %s
-                    """,
-                    valid_rows,
-                )
-                valid_rows.clear()
+def _finish_failed_attempt(queue, msg, job_id: str, message: str, permanent: bool) -> None:
+    try:
+        new_status = processor.mark_retry_or_fail(job_id, message, permanent)
+    except Exception:  # noqa: BLE001 - DB unreachable: leave the message to reappear
+        logger.exception("Could not record failure for job %s; message will be redelivered.", job_id)
+        return
 
-            # Flush error rows in batches
-            if len(error_rows) >= BATCH_SIZE:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO job_errors (job_id, row_number, error_message)
-                    VALUES %s
-                    """,
-                    error_rows,
-                )
-                error_rows.clear()
+    if new_status == "QUEUED":
+        attempt = max(1, processor.get_attempt_count(job_id))
+        delay = settings.RETRY_DELAY_SECONDS * attempt
+        logger.info("Job %s will be retried in %ss (attempt %d used).", job_id, delay, attempt)
+        _safe_hide(queue, msg, delay)
+    else:
+        logger.info("Job %s is FAILED - dropping message.", job_id)
+        _safe_delete(queue, msg)
 
-            # Periodic progress heartbeat to PostgreSQL
-            if processed_count % BATCH_SIZE == 0:
-                cur.execute(
-                    """
-                    UPDATE upload_jobs 
-                    SET processed_rows = %s, updated_at = NOW() 
-                    WHERE id = %s
-                    """,
-                    (processed_count, job_id),
-                )
-                conn.commit()
-                logger.info(f"Job {job_id}: Processed {processed_count} rows...")
 
-        # Final flush for remaining valid rows
-        if valid_rows:
-            execute_values(
-                cur,
-                """
-                INSERT INTO marathon_participants 
-                    (first_name, last_name, email, bib_number, category, registration_fee, job_id)
-                VALUES %s
-                """,
-                valid_rows,
-            )
+def main() -> None:
+    settings.validate()
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
 
-        # Final flush for remaining error rows
-        if error_rows:
-            execute_values(
-                cur,
-                """
-                INSERT INTO job_errors (job_id, row_number, error_message)
-                VALUES %s
-                """,
-                error_rows,
-            )
+    queue = QueueClient.from_connection_string(
+        settings.AZURE_STORAGE_CONNECTION_STRING, settings.QUEUE_NAME
+    )
+    logger.info(
+        "Worker started: queue=%s batch_size=%d max_attempts=%d",
+        settings.QUEUE_NAME, settings.BATCH_SIZE, settings.MAX_ATTEMPTS,
+    )
 
-        # Mark job COMPLETED
-        cur.execute(
-            """
-            UPDATE upload_jobs 
-            SET status = 'COMPLETED', total_rows = %s, processed_rows = %s, updated_at = NOW() 
-            WHERE id = %s
-            """,
-            (processed_count, processed_count, job_id),
-        )
-        conn.commit()
-        logger.info(f"Job {job_id} COMPLETED. Total rows: {processed_count}")
-
-    except Exception as exc:
-        conn.rollback()
-        logger.error(f"Error processing job {job_id}: {exc}", exc_info=True)
+    while not shutdown.is_set():
         try:
-            cur.execute(
-                """
-                UPDATE upload_jobs 
-                SET status = 'FAILED', updated_at = NOW() 
-                WHERE id = %s
-                """,
-                (job_id,),
-            )
-            conn.commit()
-        except Exception as inner_exc:
-            logger.error(f"Failed to record FAILED status for job {job_id}: {inner_exc}")
-        raise exc
-    finally:
-        cur.close()
-        conn.close()
+            got_message = False
+            for msg in queue.receive_messages(
+                messages_per_page=1,
+                visibility_timeout=settings.VISIBILITY_TIMEOUT_SECONDS,
+            ):
+                got_message = True
+                handle_message(queue, msg)
+                break  # one job at a time; loop around for the next
+            if not got_message:
+                shutdown.wait(settings.POLL_INTERVAL_SECONDS)
+        except Exception:  # noqa: BLE001 - never die on a transient queue/network error
+            logger.exception("Queue loop error; backing off.")
+            shutdown.wait(5)
+
+    logger.info("Worker stopped.")
+
+
+if __name__ == "__main__":
+    main()
