@@ -1,76 +1,60 @@
-"""worker/test_local.py
+"""worker/local_test.py
 
-Local ingestion harness for testing Excel processing.
-Simulates end-to-end ingestion of an Excel file without requiring active Azure
-Service Bus or Azure Blob Storage infrastructure by creating a local job record,
-invoking the streaming processor, and asserting database state.
+Developer harness: run the ingestion pipeline on a local .xlsx WITHOUT the queue
+or blob storage. It still writes to whatever database DATABASE_URL points at.
+
+    cd worker
+    python local_test.py ../test-data/sample_10k.xlsx
+    python local_test.py ../test-data/sample_10k.xlsx   # 2nd run -> every row is a duplicate
 """
-
-import io
 import os
+import sys
 import uuid
-from consumer import get_db_connection, process_excel_stream
+
+from processor import get_connection, ingest_file
 
 
-def test_local_ingestion(sample_path: str) -> None:
-    """Run an isolated local test of the Excel ingestion pipeline.
-
-    Args:
-        sample_path: File system path pointing to the test .xlsx file.
-    """
+def run(sample_path: str) -> None:
     job_id = str(uuid.uuid4())
-    filename = os.path.basename(sample_path)
-
-    print(f"Creating job record {job_id} in database...")
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO upload_jobs (id, file_name, file_hash, status, created_at, updated_at)
-        VALUES (%s, %s, %s, 'QUEUED', NOW(), NOW())
-        """,
-        (job_id, filename, f"hash-{job_id[:8]}"),
-    )
-    conn.commit()
-    cur.close()
+    conn = get_connection()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO upload_jobs (id, file_name, blob_name, status, attempt_count, started_at)
+            VALUES (%s, %s, %s, 'PROCESSING', 1, NOW())
+            """,
+            (job_id, os.path.basename(sample_path), f"local/{job_id}.xlsx"),
+        )
     conn.close()
 
-    print(f"Parsing and processing '{sample_path}'...")
-    with open(sample_path, "rb") as f:
-        stream = io.BytesIO(f.read())
-        process_excel_stream(stream, job_id)
+    print(f"Job {job_id}: ingesting {sample_path} ...")
+    stats = ingest_file(sample_path, job_id)
 
-    # Check results against the actual schema table (marathon_participants)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT status, total_rows, processed_rows FROM upload_jobs WHERE id = %s",
-        (job_id,),
-    )
-    status, total, processed = cur.fetchone()
-
-    # Note: Target table is marathon_participants and column is job_id
-    cur.execute(
-        "SELECT COUNT(*) FROM marathon_participants WHERE job_id = %s",
-        (job_id,),
-    )
-    valid_count = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM job_errors WHERE job_id = %s", (job_id,))
-    error_count = cur.fetchone()[0]
-
-    print("\n--- Ingestion Verification Summary ---")
-    print(f"Job Status:      {status}")
-    print(f"Rows Processed:  {processed} / {total}")
-    print(f"Valid Inserted:  {valid_count}")
-    print(f"Errors Logged:   {error_count}")
-
-    cur.close()
+    conn = get_connection()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, total_rows, processed_rows, inserted_rows, duplicate_rows, invalid_rows "
+            "FROM upload_jobs WHERE id = %s",
+            (job_id,),
+        )
+        status, total, processed, inserted, dupes, invalid = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM marathon_participants WHERE job_id = %s", (job_id,))
+        in_table = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM job_errors WHERE job_id = %s", (job_id,))
+        error_rows = cur.fetchone()[0]
     conn.close()
+
+    print("\n--- Ingestion summary ---")
+    print(f"Status:            {status}")
+    print(f"Rows processed:    {processed} / {total}")
+    print(f"Inserted:          {inserted} (rows in table: {in_table})")
+    print(f"Duplicates:        {dupes}")
+    print(f"Invalid:           {invalid}")
+    print(f"job_errors rows:   {error_rows}")
+    assert in_table == inserted == stats.inserted
+    assert error_rows == dupes + invalid
 
 
 if __name__ == "__main__":
-    sample_file = "../test-data/sample_10k.xlsx"
-    if not os.path.exists(sample_file):
-        sample_file = "test-data/sample_10k.xlsx"
-    test_local_ingestion(sample_file)
+    path = sys.argv[1] if len(sys.argv) > 1 else "../test-data/sample_10k.xlsx"
+    run(path)

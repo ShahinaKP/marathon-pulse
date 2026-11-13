@@ -6,6 +6,7 @@ and query background ingestion lifecycle states with row-level error reporting.
 """
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from app.models.schemas import JobStatusResponse, JobUploadResponse
@@ -31,41 +32,38 @@ def get_upload_service() -> UploadService:
     response_model=JobUploadResponse,
     status_code=status.HTTP_202_ACCEPTED,
     responses={
-        status.HTTP_200_OK: {
-            "model": JobUploadResponse,
-            "description": "File has already been uploaded previously (duplicate detected).",
-        },
         status.HTTP_202_ACCEPTED: {
             "model": JobUploadResponse,
             "description": "File accepted and queued for background ingestion.",
         },
         status.HTTP_400_BAD_REQUEST: {
-            "description": "Invalid file type. Only .xlsx and .xls extensions are supported.",
+            "description": "Not a valid .xlsx workbook (extension or content).",
         },
+        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE: {
+            "description": "File exceeds the configured size limit.",
+        },
+        status.HTTP_502_BAD_GATEWAY: {"description": "Blob storage unavailable."},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Queue unavailable."},
     },
 )
 async def upload_file(
     file: UploadFile = File(...),
     service: UploadService = Depends(get_upload_service),
 ) -> JSONResponse:
-    """Stream and enqueue an Excel file for background processing.
+    """Register, store and enqueue an Excel file, then return immediately (HTTP 202).
 
-    Validates extension, computes checksum deduplication, uploads binary payload
-    to blob storage, creates database record, and publishes a queue notification.
+    Parsing and database insertion happen later in the cloud worker. The
+    blocking work (DB, Blob, Queue SDK calls) runs in a thread pool so the
+    event loop stays free for concurrent uploads.
     """
-    if not file.filename.lower().endswith((".xlsx", ".xls")):
+    if not (file.filename or "").lower().endswith(".xlsx"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file format. Only Excel files (.xlsx, .xls) are accepted.",
+            detail="Invalid file format. Only .xlsx files are accepted.",
         )
 
-    result = await service.process_streaming_upload(file)
-    http_code = (
-        status.HTTP_200_OK
-        if "Duplicate" in result["message"]
-        else status.HTTP_202_ACCEPTED
-    )
-    return JSONResponse(status_code=http_code, content=result)
+    result = await run_in_threadpool(service.process_upload, file.filename, file.file)
+    return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=result)
 
 
 @router.get(

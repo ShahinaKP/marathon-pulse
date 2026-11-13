@@ -3,7 +3,7 @@
 Pytest test harness and fixture configuration.
 Configures FastAPI dependency overrides and service mocks to test API routes,
 request validation, and HTTP responses in isolation without active database,
-Azure Blob Storage, or Azure Service Bus infrastructure.
+Azure Blob Storage, or Azure Storage Queue infrastructure.
 """
 
 from unittest.mock import MagicMock

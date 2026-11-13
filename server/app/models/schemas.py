@@ -31,6 +31,10 @@ class JobStatusResponse(BaseModel):
     status: str
     total_rows: int
     processed_rows: int
+    inserted_rows: int = 0
+    duplicate_rows: int = 0
+    invalid_rows: int = 0
+    error_message: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     errors: List[RowErrorDetail] = []

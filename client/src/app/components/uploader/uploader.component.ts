@@ -14,6 +14,7 @@ export interface FileQueueItem {
   message: string | null;
   errors: RowErrorDetail[];
   subscription?: Subscription;
+  isDuplicate?: boolean;
 }
 
 @Component({
@@ -70,37 +71,51 @@ export class UploaderComponent implements OnDestroy {
   private addFilesToQueue(files: FileList): void {
     const validExtensions = ['.xlsx', '.xls'];
     const newItems: FileQueueItem[] = [];
+    const currentQueue = this.fileQueue();
     let invalidCount = 0;
+    let duplicateCount = 0;
 
     Array.from(files).forEach((file) => {
       const fileName = file.name.toLowerCase();
       const isValid = validExtensions.some((ext) => fileName.endsWith(ext));
 
-      if (isValid) {
-        newItems.push({
-          id: `${file.name}-${Date.now()}-${Math.random()}`,
-          file,
-          jobId: null,
-          status: 'READY',
-          processedRows: 0,
-          totalRows: 0,
-          progress: 0,
-          message: null,
-          errors: [],
-        });
-      } else {
+      if (!isValid) {
         invalidCount++;
+        return;
       }
+
+      // Check if file with same name and size is already queued
+      const isAlreadyQueued = currentQueue.some(
+        (existing) => existing.file.name === file.name && existing.file.size === file.size,
+      );
+
+      if (isAlreadyQueued) {
+        duplicateCount++;
+        return;
+      }
+
+      newItems.push({
+        id: `${file.name}-${Date.now()}-${Math.random()}`,
+        file,
+        jobId: null,
+        status: 'READY',
+        processedRows: 0,
+        totalRows: 0,
+        progress: 0,
+        message: null,
+        errors: [],
+      });
     });
 
+    const warnings: string[] = [];
     if (invalidCount > 0) {
-      this.globalError.set(
-        `${invalidCount} non-Excel file(s) were excluded. Only .xlsx and .xls are supported.`,
-      );
-    } else {
-      this.globalError.set(null);
+      warnings.push(`${invalidCount} non-Excel file(s) excluded.`);
+    }
+    if (duplicateCount > 0) {
+      warnings.push(`${duplicateCount} duplicate file(s) already in the queue were skipped.`);
     }
 
+    this.globalError.set(warnings.length > 0 ? warnings.join(' ') : null);
     this.fileQueue.update((current) => [...current, ...newItems]);
   }
 
@@ -127,28 +142,40 @@ export class UploaderComponent implements OnDestroy {
 
     this.uploadService.uploadFile(item.file).subscribe({
       next: (res) => {
+        const isDup = res.message.toLowerCase().includes('duplicate');
         this.updateItem(item.id, {
           jobId: res.job_id,
           status: (res.status as FileQueueItem['status']) || 'QUEUED',
           message: res.message,
+          isDuplicate: isDup,
         });
-        this.pollItemJob(item.id, res.job_id);
+        this.pollItemJob(item.id, res.job_id, isDup);
       },
       error: (err) => {
         this.updateItem(item.id, {
           status: 'FAILED',
           message: err.error?.detail || 'Upload failed.',
+          isDuplicate: false,
         });
       },
     });
   }
 
-  private pollItemJob(itemId: string, jobId: string): void {
+  private pollItemJob(itemId: string, jobId: string, isDuplicate = false): void {
     const sub = this.uploadService.pollJobStatus(jobId).subscribe({
       next: (job: JobStatusResponse) => {
         const total = job.total_rows || 0;
         const processed = job.processed_rows || 0;
         const progress = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+
+        let statusMessage = 'Queued in buffer...';
+        if (isDuplicate) {
+          statusMessage = 'Duplicate file detected — loaded existing job results.';
+        } else if (job.status === 'COMPLETED') {
+          statusMessage = 'Ingestion completed successfully';
+        } else if (job.status === 'PROCESSING') {
+          statusMessage = 'Parsing records in background...';
+        }
 
         this.updateItem(itemId, {
           status: job.status,
@@ -156,12 +183,7 @@ export class UploaderComponent implements OnDestroy {
           totalRows: total,
           progress: job.status === 'COMPLETED' ? 100 : progress,
           errors: job.errors || [],
-          message:
-            job.status === 'COMPLETED'
-              ? 'Ingestion completed successfully'
-              : job.status === 'PROCESSING'
-                ? 'Parsing records in background...'
-                : 'Queued in buffer...',
+          message: statusMessage,
         });
       },
       error: (err) => {
