@@ -26,7 +26,7 @@
         type="file"
         #fileInput
         (change)="onFilesSelected($event)"
-        accept=".xlsx, .xls"
+        accept=".xlsx"
         multiple
         class="hidden"
       />
@@ -51,7 +51,7 @@
           <p class="text-sm font-medium text-slate-700">
             Drag & drop one or multiple Excel files here, or
           </p>
-          <p class="text-xs text-slate-400 mt-1">Supports batch ingestion of .xlsx and .xls</p>
+          <p class="text-xs text-slate-400 mt-1">Supports batch ingestion of .xlsx workbooks (save older .xls files as .xlsx first)</p>
         </div>
 
         <button
@@ -88,6 +88,12 @@
         <span
           >Completed: <strong class="text-emerald-600">{{ completedCount() }}</strong></span
         >
+        <ng-container *ngIf="failedCount() > 0">
+          <span>&bull;</span>
+          <span
+            >Failed: <strong class="text-red-600">{{ failedCount() }}</strong></span
+          >
+        </ng-container>
       </div>
 
       <div class="flex items-center space-x-3">
@@ -181,7 +187,7 @@
             class="px-2.5 py-1 text-xs font-semibold bg-blue-50 text-blue-600 hover:bg-blue-100 rounded transition"
             (click)="startUploadSingle(item)"
           >
-            Start
+            {{ item.status === 'FAILED' ? 'Retry' : 'Start' }}
           </button>
 
           <button
@@ -225,13 +231,30 @@
         >
           {{ item.message }}
         </p>
+
+        <!-- Result counters -->
+        <div
+          *ngIf="item.status === 'PROCESSING' || item.status === 'COMPLETED' || item.processedRows > 0"
+          class="flex flex-wrap gap-2 pt-1 text-xs"
+        >
+          <span class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700">
+            Inserted: <strong>{{ item.insertedRows | number }}</strong>
+          </span>
+          <span class="px-2 py-0.5 rounded bg-amber-50 text-amber-700">
+            Duplicates: <strong>{{ item.duplicateRows | number }}</strong>
+          </span>
+          <span class="px-2 py-0.5 rounded bg-red-50 text-red-700">
+            Invalid: <strong>{{ item.invalidRows | number }}</strong>
+          </span>
+        </div>
       </div>
 
       <!-- Row-Level Error Details -->
       <div *ngIf="item.errors.length > 0" class="pt-3 border-t border-slate-100 space-y-2">
         <div class="flex items-center justify-between">
           <h4 class="text-xs font-bold text-red-600">
-            Validation Errors ({{ item.errors.length }})
+            Row issues: duplicates and invalid rows (showing {{ item.errors.length | number }} of
+            {{ item.duplicateRows + item.invalidRows | number }})
           </h4>
         </div>
 
@@ -243,7 +266,7 @@
                   Row #
                 </th>
                 <th scope="col" class="px-3 py-1.5 text-left font-semibold text-slate-600">
-                  Failure Reason
+                  Reason
                 </th>
               </tr>
             </thead>
