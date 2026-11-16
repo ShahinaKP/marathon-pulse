@@ -20,3 +20,6 @@ __pycache__/
 *.local-backup
 devops/.suffix
 devops/generated.env
+
+# Generated demo workbooks (see docs/demo-script.md)
+test-data/demo_*.xlsx

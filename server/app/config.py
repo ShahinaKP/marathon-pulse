@@ -22,6 +22,7 @@ class Settings:
     BLOB_CONTAINER_NAME: str = os.getenv("BLOB_CONTAINER_NAME", "excel-uploads")
     QUEUE_NAME: str = os.getenv("QUEUE_NAME", "excel-jobs")
     MAX_UPLOAD_MB: int = int(os.getenv("MAX_UPLOAD_MB", "50"))
+    DB_POOL_MAX: int = int(os.getenv("DB_POOL_MAX", "10"))  # max pooled PostgreSQL connections
 
 
 settings = Settings()

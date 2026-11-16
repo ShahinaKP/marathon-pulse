@@ -25,7 +25,8 @@ class ParticipantRowSchema(BaseModel):
     email: EmailStr
     bib_number: str = Field(..., min_length=1, max_length=50)
     category: RaceCategory
-    registration_fee: float = Field(..., ge=0.0, allow_inf_nan=False)
+    # NUMERIC(10,2) in the database: anything larger would fail the whole batch insert
+    registration_fee: float = Field(..., ge=0.0, le=99_999_999.99, allow_inf_nan=False)
 
     @field_validator("first_name", "last_name", mode="before")
     @classmethod

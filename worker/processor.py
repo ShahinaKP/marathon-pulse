@@ -134,13 +134,13 @@ def claim_job(job_id: str) -> Tuple[str, Optional[str]]:
         conn.close()
 
 
-def mark_retry_or_fail(job_id: str, message: str, permanent: bool) -> Optional[str]:
+def mark_retry_or_fail(job_id: str, message: str, permanent: bool) -> Optional[Tuple[str, int]]:
     """After a failed attempt: put the job back to QUEUED for a retry, or fail it for good.
 
     A job fails for good when the error is permanent or attempts are used up.
     Final failure removes the job's partial rows, so a FAILED job leaves no
-    half-loaded data behind. Returns the new status, or None if the job was
-    already finished.
+    half-loaded data behind. Returns (new_status, attempt_count), or None if the
+    job was already finished.
     """
     conn = get_connection()
     try:
@@ -156,27 +156,33 @@ def mark_retry_or_fail(job_id: str, message: str, permanent: bool) -> Optional[s
                     error_message = %(msg)s,
                     updated_at = NOW()
                 WHERE id = %(id)s AND status IN ('QUEUED', 'PROCESSING')
-                RETURNING status
+                RETURNING status, attempt_count
                 """,
                 {"perm": permanent, "max": settings.MAX_ATTEMPTS, "msg": message[:1000], "id": job_id},
             )
             row = cur.fetchone()
-            new_status = row[0] if row else None
-            if new_status == "FAILED":
+            if row and row[0] == "FAILED":
                 cur.execute("DELETE FROM marathon_participants WHERE job_id = %s", (job_id,))
         conn.commit()
-        return new_status
+        return (row[0], row[1]) if row else None
     finally:
         conn.close()
 
 
-def get_attempt_count(job_id: str) -> int:
+def touch_job(job_id: str) -> None:
+    """Heartbeat: prove this worker is alive so nobody else reclaims the job.
+
+    Called on a timer by the lease keeper, independent of row progress, so a slow
+    batch or a long download cannot make a healthy job look dead.
+    """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT attempt_count FROM upload_jobs WHERE id = %s", (job_id,))
-            row = cur.fetchone()
-            return row[0] if row else 0
+            cur.execute(
+                "UPDATE upload_jobs SET updated_at = NOW() WHERE id = %s AND status = 'PROCESSING'",
+                (job_id,),
+            )
+        conn.commit()
     finally:
         conn.close()
 
@@ -281,6 +287,29 @@ def _flush(conn, cur, job_id: str, batch: List[tuple], errors: List[tuple], stat
     conn.commit()
 
 
+def _maybe_crash_for_demo(job_id: str, processed: int) -> None:
+    """DEMO/TEST ONLY: simulate a worker crash to prove recovery.
+
+    Does nothing unless CHAOS_CRASH_AFTER_ROWS is set. When it is, the process is killed
+    without any cleanup (like an out-of-memory kill or a lost VM) once `processed` reaches
+    the limit, and only on the job's first attempt, so the retry can finish normally.
+    """
+    limit = settings.CHAOS_CRASH_AFTER_ROWS
+    if not limit or processed < limit:
+        return
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT attempt_count FROM upload_jobs WHERE id = %s", (job_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row and row[0] == 1:
+        logger.critical("CHAOS: simulating a hard crash of job %s after %d rows", job_id, processed)
+        logging.shutdown()  # flush the log line, then die without any cleanup
+        os._exit(137)
+
+
 def ingest_file(path: str, job_id: str) -> Counters:
     """Stream-parse a local .xlsx and load it into PostgreSQL for `job_id`."""
     stats = Counters()
@@ -333,6 +362,7 @@ def ingest_file(path: str, job_id: str) -> Counters:
                     if stats.processed % settings.BATCH_SIZE == 0:
                         _flush(conn, cur, job_id, batch, errors, stats)
                         logger.info("Job %s: %d rows processed", job_id, stats.processed)
+                        _maybe_crash_for_demo(job_id, stats.processed)
 
                 _flush(conn, cur, job_id, batch, errors, stats)  # remainder
 
