@@ -127,7 +127,7 @@ infra() {
       if ! az postgres flexible-server create --name "$PG_SERVER" --resource-group "$RG" \
             --location "$PG_LOCATION" \
             --admin-user "$PG_ADMIN" --admin-password "$PG_ADMIN_PASSWORD" \
-            --sku-name Standard_B1ms --tier Burstable --storage-size 32 --version 16 \
+            --sku-name Standard_B2s --tier Burstable --storage-size 32 --version 16 \
             --public-access "$MY_IP" --yes -o none; then
         echo "" >&2
         echo "Postgres creation failed. If the error was SkuNotAvailable, your subscription cannot" >&2
